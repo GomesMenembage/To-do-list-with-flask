@@ -1,41 +1,99 @@
-from flask import Flask, render_template, redirect, url_for, request
-from models import db, Note, Category
-from forms import NoteForm
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///notes.db'
-app.config['SECRET_KEY'] = 'chave-secreta'
-db.init_app(app)
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///todo.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["JWT_SECRET_KEY"] = "super-secret"  # Troque por algo seguro em produção
 
+db = SQLAlchemy(app)
+jwt = JWTManager(app)
+
+# MODELOS
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(120), nullable=False)
+    tasks = db.relationship("Task", backref="owner", lazy=True)
+
+class Task(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(200))
+    completed = db.Column(db.Boolean, default=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+
+# ROTAS DE AUTENTICAÇÃO
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.json
+    if User.query.filter_by(username=data["username"]).first():
+        return jsonify({"error": "Usuário já existe"}), 400
+    hashed_pw = generate_password_hash(data["password"])
+    user = User(username=data["username"], password=hashed_pw)
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"message": "Usuário registrado com sucesso"}), 201
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.json
+    user = User.query.filter_by(username=data["username"]).first()
+    if not user or not check_password_hash(user.password, data["password"]):
+        return jsonify({"error": "Credenciais inválidas"}), 401
+    token = create_access_token(identity=user.id)
+    return jsonify(access_token=token)
+
+# ROTAS DE TAREFAS (PROTEGIDAS)
+@app.route("/tasks", methods=["POST"])
+@jwt_required()
+def create_task():
+    user_id = get_jwt_identity()
+    data = request.json
+    task = Task(title=data["title"], description=data.get("description", ""), user_id=user_id)
+    db.session.add(task)
+    db.session.commit()
+    return jsonify({"message": "Tarefa criada", "task": task.id}), 201
+
+@app.route("/tasks", methods=["GET"])
+@jwt_required()
+def get_tasks():
+    user_id = get_jwt_identity()
+    tasks = Task.query.filter_by(user_id=user_id).all()
+    return jsonify([{
+        "id": t.id,
+        "title": t.title,
+        "description": t.description,
+        "completed": t.completed
+} for t in tasks])
+
+@app.route("/tasks/<int:task_id>", methods=["PUT"])
+@jwt_required()
+def update_task(task_id):
+    user_id = get_jwt_identity()
+    task = Task.query.filter_by(id=task_id, user_id=user_id).first_or_404()
+    data = request.json
+    task.title = data.get("title", task.title)
+    task.description = data.get("description", task.description)
+    task.completed = data.get("completed", task.completed)
+    db.session.commit()
+    return jsonify({"message": "Tarefa atualizada"})
+
+@app.route("/tasks/<int:task_id>", methods=["DELETE"])
+@jwt_required()
+def delete_task(task_id):
+    user_id = get_jwt_identity()
+    task = Task.query.filter_by(id=task_id, user_id=user_id).first_or_404()
+    db.session.delete(task)
+    db.session.commit()
+    return jsonify({"message": "Tarefa excluída"})
+
+# INICIALIZAÇÃO
 @app.before_first_request
 def create_tables():
     db.create_all()
 
-@app.route('/')
-def index():
-    keyword = request.args.get('keyword')
-    if keyword:
-        notes = Note.query.filter(Note.title.contains(keyword) | Note.content.contains(keyword)).all()
-    else:
-        notes = Note.query.all()
-    return render_template('index.html', notes=notes)
-
-@app.route('/add', methods=['GET', 'POST'])
-def add_note():
-    form = NoteForm()
-    form.category.choices = [(c.id, c.name) for c in Category.query.all()]
-    if form.validate_on_submit():
-        new_note = Note(
-            title=form.title.data,
-            content=form.content.data,
-            category_id=form.category.data
-        )
-        db.session.add(new_note)
-        db.session.commit()
-        return redirect(url_for('index'))
-    return render_template('addnotas.html', form=form)
-
-@app.route('/categories')
-def manage_categories():
-    categories = Category.query.all()
-    return render_template('categorias.html', categories=categories)
+if __name__ == "__main__":
+    app.run(debug=True)
